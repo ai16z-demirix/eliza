@@ -7,6 +7,20 @@ import {
 } from "@elizaos/core";
 import { type TdxQuoteResponse, TappdClient, type TdxQuoteHashAlgorithms } from "@phala/dstack-sdk";
 import { type RemoteAttestationQuote, TEEMode, type RemoteAttestationMessage } from "../types/tee";
+import { withRetry, RetryableError } from "../utils/retry";
+
+// List of error messages that indicate transient failures
+const RETRYABLE_ERROR_PATTERNS = [
+    'timeout',
+    'network',
+    'connection',
+    'econnrefused',
+    'socket hang up',
+    'socket closed',
+    'server error',
+    '5xx',
+    'rate limit'
+].map(pattern => new RegExp(pattern, 'i'));
 
 class RemoteAttestationProvider {
     private client: TappdClient;
@@ -43,31 +57,49 @@ class RemoteAttestationProvider {
         this.client = endpoint ? new TappdClient(endpoint) : new TappdClient();
     }
 
+    private isRetryableError(error: Error): boolean {
+        const errorMessage = error.message.toLowerCase();
+        return RETRYABLE_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage));
+    }
+
     async generateAttestation(
         reportData: string,
         hashAlgorithm?: TdxQuoteHashAlgorithms
     ): Promise<RemoteAttestationQuote> {
         try {
             elizaLogger.log("Generating attestation for: ", reportData);
-            const tdxQuote: TdxQuoteResponse =
-                await this.client.tdxQuote(reportData, hashAlgorithm);
-            const rtmrs = tdxQuote.replayRtmrs();
-            elizaLogger.log(
-                `rtmr0: ${rtmrs[0]}\nrtmr1: ${rtmrs[1]}\nrtmr2: ${rtmrs[2]}\nrtmr3: ${rtmrs[3]}f`
-            );
-            const quote: RemoteAttestationQuote = {
-                quote: tdxQuote.quote,
+            
+            const quote = await withRetry(async () => {
+                try {
+                    const tdxQuote: TdxQuoteResponse = await this.client.tdxQuote(
+                        reportData,
+                        hashAlgorithm
+                    );
+                    const rtmrs = tdxQuote.replayRtmrs();
+                    elizaLogger.log(
+                        `rtmr0: ${rtmrs[0]}\nrtmr1: ${rtmrs[1]}\nrtmr2: ${rtmrs[2]}\nrtmr3: ${rtmrs[3]}`
+                    );
+                    return tdxQuote;
+                } catch (error) {
+                    // If it's a retryable error, wrap it
+                    if (error instanceof Error && this.isRetryableError(error)) {
+                        throw new RetryableError(error.message);
+                    }
+                    // Otherwise, rethrow the original error
+                    throw error;
+                }
+            });
+
+            const attestation: RemoteAttestationQuote = {
+                quote: quote.quote,
                 timestamp: Date.now(),
             };
-            elizaLogger.log("Remote attestation quote: ", quote);
-            return quote;
+            elizaLogger.log("Remote attestation quote: ", attestation);
+            return attestation;
         } catch (error) {
             console.error("Error generating remote attestation:", error);
-            throw new Error(
-                `Failed to generate TDX Quote: ${
-                    error instanceof Error ? error.message : "Unknown error"
-                }`
-            );
+            const errorMessage = error instanceof Error ? error.message : "Unknown error";
+            throw new Error(`Failed to generate TDX Quote: ${errorMessage}`);
         }
     }
 }
@@ -100,7 +132,7 @@ const remoteAttestationProvider: Provider = {
                 }`
             );
         }
-    },
+    }
 };
 
 export { remoteAttestationProvider, RemoteAttestationProvider };
